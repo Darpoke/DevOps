@@ -1,2 +1,3 @@
 New File to be merged
 Modified Fifth.txt
+Line 3 added.
