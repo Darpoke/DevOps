@@ -1,0 +1,258 @@
+// Jenkinsfile (Declarative) — Production-ready blueprint
+// Features:
+//  - Checkout, lint, unit tests, build (artifact), container image build & push
+//  - Deploy to TEST k8s namespace, run smoke/integration tests
+//  - Manual approval (input) gate for PROD
+//  - Deploy to PROD namespace with basic rollback support
+//  - Proper credentials handling, artifact archiving, and notifications hooks
+//
+// NOTES: replace placeholders (<...>) with your real values.
+// Prereqs: Jenkins agents with Docker & kubectl/helm (or use Kubernetes plugin agents), Docker registry credentials, kubeconfigs as credentials, and stable artifact storage (Nexus/Artifactory).
+
+pipeline {
+  agent { label 'linux && docker' }          // choose an appropriate agent
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '50'))
+    timeout(time: 60, unit: 'MINUTES')
+    timestamps()
+    ansiColor('xterm')
+    skipStagesAfterUnstable()
+  }
+  environment {
+    // non-sensitive defaults
+    APP_NAME       = 'my-app'
+    DOCKER_REG     = 'registry.example.com'         // e.g. my-registry.azurecr.io
+    IMAGE_NAME     = "${env.DOCKER_REG}/${env.APP_NAME}"
+    TEST_NAMESPACE = 'test'
+    PROD_NAMESPACE = 'prod'
+    // IMAGE_TAG will be set later to include branch + build number / SHA
+  }
+  parameters {
+    string(name: 'BRANCH', defaultValue: 'main', description: 'Git branch to build')
+    booleanParam(name: 'SKIP_INTEGRATION_TESTS', defaultValue: false, description: 'Skip integration tests on TEST env')
+  }
+  stages {
+
+    stage('Prepare') {
+      steps {
+        script {
+          env.IMAGE_TAG = "${params.BRANCH.replaceAll('/','-')}-${env.BUILD_NUMBER}"
+        }
+        checkout scm: [
+          $class: 'GitSCM',
+          branches: [[name: "*/${params.BRANCH}"]],
+          userRemoteConfigs: [[url: 'https://github.com/your-org/your-repo.git']]
+        ]
+        echo "Building ${env.APP_NAME}:${env.IMAGE_TAG}"
+      }
+      post {
+        failure { archiveArtifacts artifacts: '**/build/reports/**', allowEmptyArchive: true }
+      }
+    }
+
+    stage('Static Analysis / Lint') {
+      parallel {
+        stage('Code Lint (backend)') {
+          when { expression { fileExists('pom.xml') } } // example for Maven
+          steps {
+            sh 'mvn -B -q spotbugs:check || true' // do not fail pipeline on lint if you want soft-fail; change as needed
+            sh 'mvn -B -q validate'
+          }
+        }
+        stage('Code Lint (frontend)') {
+          when { expression { fileExists('package.json') } }
+          steps {
+            sh 'npm ci'
+            sh 'npm run lint || true'
+          }
+        }
+      }
+    }
+
+    stage('Unit Tests') {
+      parallel {
+        stage('Backend Unit Tests') {
+          when { expression { fileExists('pom.xml') } }
+          steps {
+            sh 'mvn -B -q test'
+            junit '**/target/surefire-reports/*.xml'
+            archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
+          }
+        }
+        stage('Frontend Unit Tests') {
+          when { expression { fileExists('package.json') } }
+          steps {
+            sh 'npm test --silent'
+            // if tests produce JUnit xml, collect them
+            junit allowEmptyResults: true, testResults: 'test-results/**/*.xml'
+            archiveArtifacts artifacts: 'dist/**', allowEmptyArchive: true
+          }
+        }
+      }
+    }
+
+    stage('Build Artifact') {
+      steps {
+        script {
+          if (fileExists('pom.xml')) {
+            sh 'mvn -B -q package -DskipTests'
+            stash includes: 'target/*.jar', name: 'app-artifact'
+          } else if (fileExists('package.json')) {
+            sh 'npm run build'
+            stash includes: 'dist/**', name: 'app-artifact'
+          } else {
+            error "Unsupported project type: no pom.xml or package.json found"
+          }
+        }
+      }
+    }
+
+    stage('Build & Push Docker Image') {
+      environment {
+        // Inject sensitive creds via withCredentials below
+      }
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'docker-registry-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')
+        ]) {
+          sh '''
+            set -e
+            # prepare build context (unstash)
+            rm -rf docker-context || true
+            mkdir docker-context
+            git rev-parse --short HEAD > docker-context/REVISION
+            # copy artifact into docker context
+            mkdir -p docker-context/app
+          '''
+          unstash 'app-artifact'
+          sh '''
+            # move artifacts into docker-context/app (adjust path according to build)
+            if [ -f target/*.jar ]; then
+              cp target/*.jar docker-context/app/app.jar || true
+            elif [ -d dist ]; then
+              cp -r dist/* docker-context/app/
+            fi
+          '''
+          // Build and push
+          sh """
+            docker login ${env.DOCKER_REG} -u "$DOCKER_USER" -p "$DOCKER_PASS"
+            docker build -t ${env.IMAGE_NAME}:${env.IMAGE_TAG} docker-context
+            docker push ${env.IMAGE_NAME}:${env.IMAGE_TAG}
+            docker logout ${env.DOCKER_REG}
+          """
+        }
+        // fingerprint the image reference by writing metadata
+        writeFile file: 'image-info.txt', text: "${env.IMAGE_NAME}:${env.IMAGE_TAG}"
+        archiveArtifacts artifacts: 'image-info.txt', fingerprint: true
+      }
+    }
+
+    stage('Deploy to TEST') {
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig-test', variable: 'KUBECONFIG_FILE')]) {
+          sh '''
+            export KUBECONFIG=${KUBECONFIG_FILE}
+            # apply manifest or helm upgrade -- create a simple k8s deployment update
+            kubectl set image deployment/${APP_NAME} ${APP_NAME}=${IMAGE_NAME}:${IMAGE_TAG} -n ${TEST_NAMESPACE} || \
+            kubectl apply -f k8s/test-deployment.yaml -n ${TEST_NAMESPACE}
+            # wait for rollout
+            kubectl rollout status deployment/${APP_NAME} -n ${TEST_NAMESPACE} --timeout=120s
+            # annotate deployment with build info
+            kubectl patch deployment ${APP_NAME} -n ${TEST_NAMESPACE} --type='json' -p "[{\"op\":\"add\",\"path\":\"/metadata/annotations/build\",\"value\":\"${IMAGE_TAG}\"}]" || true
+          '''
+        }
+      }
+    }
+
+    stage('Post-deploy Tests (TEST)') {
+      when { expression { !params.SKIP_INTEGRATION_TESTS } }
+      steps {
+        // run smoke or integration tests against TEST environment URL
+        sh '''
+          # e.g. run a script that performs smoke tests
+          ./scripts/run-smoke-tests.sh --env test || (echo "Smoke tests failed" && exit 1)
+        '''
+        // capture results
+        junit allowEmptyResults: true, testResults: 'test-results/**/*.xml'
+      }
+    }
+
+    stage('Await Manual Approval for PROD') {
+      steps {
+        script {
+          timeout(time: 72, unit: 'HOURS') {   // set an appropriate approval timeout for your org
+            def userInput = input message: "Promote ${env.IMAGE_NAME}:${env.IMAGE_TAG} to PROD?",
+                                  ok: 'Promote',
+                                  submitter: 'team-leads,devops', // comma-separated Jenkins user/group names
+                                  parameters: [
+                                    string(name: 'RELEASE_NOTES', defaultValue: "Release ${env.IMAGE_TAG}", description: 'Release notes'),
+                                    booleanParam(name: 'FORCE', defaultValue: false, description: 'Force promotion even if tests had warnings')
+                                  ]
+            echo "Approved by: ${userInput}"
+          }
+        }
+      }
+    }
+
+    stage('Deploy to PROD') {
+      steps {
+        withCredentials([file(credentialsId: 'kubeconfig-prod', variable: 'KUBECONFIG_FILE')]) {
+          sh '''
+            export KUBECONFIG=${KUBECONFIG_FILE}
+            # apply helm upgrade or kubectl set-image similar to TEST step
+            kubectl set image deployment/${APP_NAME} ${APP_NAME}=${IMAGE_NAME}:${IMAGE_TAG} -n ${PROD_NAMESPACE} || \
+            kubectl apply -f k8s/prod-deployment.yaml -n ${PROD_NAMESPACE}
+            kubectl rollout status deployment/${APP_NAME} -n ${PROD_NAMESPACE} --timeout=180s
+            kubectl patch deployment ${APP_NAME} -n ${PROD_NAMESPACE} --type='json' -p "[{\"op\":\"add\",\"path\":\"/metadata/annotations/release\",\"value\":\"${IMAGE_TAG}\"}]" || true
+          '''
+        }
+      }
+    }
+
+    stage('Post-deploy Tests (PROD quick-check)') {
+      steps {
+        // non-invasive smoke checks in PROD
+        sh '''
+          ./scripts/run-smoke-tests.sh --env prod --quick || (echo "Prod smoke failed" && exit 1)
+        '''
+      }
+    }
+  }
+
+  post {
+    success {
+      script {
+        echo "Build ${env.IMAGE_NAME}:${env.IMAGE_TAG} deployed to PROD successfully."
+        // optional: notify via Slack/email
+      }
+    }
+    unstable {
+      echo 'Build finished but marked unstable.'
+    }
+    failure {
+      echo 'Pipeline failed — initiating rollback to previous stable revision.'
+      // naive rollback: set image to previous tag stored in your registry / release management
+      // implement robust rollback strategy for production use (helm rollback, k8s revision, etc.)
+      // example (requires stored previous image tag):
+      script {
+        def previousTag = '' // lookup from release metadata / image registry / deployment annotations
+        if (previousTag) {
+          withCredentials([file(credentialsId: 'kubeconfig-prod', variable: 'KUBECONFIG_FILE')]) {
+            sh '''
+              export KUBECONFIG=${KUBECONFIG_FILE}
+              kubectl set image deployment/${APP_NAME} ${APP_NAME}=${IMAGE_NAME}:${previousTag} -n ${PROD_NAMESPACE} || true
+              kubectl rollout status deployment/${APP_NAME} -n ${PROD_NAMESPACE} --timeout=120s || true
+            '''
+          }
+        } else {
+          echo "No previousTag found; manual rollback required."
+        }
+      }
+    }
+    always {
+      // collect logs, artifacts and clean workspace
+      archiveArtifacts artifacts: 'logs/**', allowEmptyArchive: true
+      cleanWs()
+    }
+  }
+}
